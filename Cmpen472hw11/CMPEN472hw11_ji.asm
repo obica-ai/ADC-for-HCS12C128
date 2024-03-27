@@ -1,0 +1,1188 @@
+;*******************************************************
+;* CMPEN 472, Hw11 Real Time Interrupt, MC9S12C128 Program
+;* CodeWarrior Simulator/Debug edition, not for CSM-12C128 board
+;* 2023/4/9  Tianhao Ji
+;* 
+;* 1 second timer, timer using Real Time Interrupt.
+;* This program is a 1 second timer using 
+;* a Real Time Interrupt service subroutine (RTIISR).  This program
+;* displays the time on the 7 Segment Disply in Visualization Tool 
+;* every 1 second.  That is, this program 
+;* displays '1 0 1 0 1 0 . . . ' on the 7 segment displys. 
+;* The 7 segment displys are connected to port B of
+;* MC9S12C32 chip in CodeWarrior Debugger/Simulator.
+;* Also on the Terminal component of the simulator,  
+;* user may enter any key, it will be displayed on the screen - effectively
+;* it is a typewriter.
+;*
+;* Please note the new feature of this program:
+;* RTI vector, initialization of CRGFLG, CRGINT, RTICTL, registers for the
+;* Real Time Interrupt.
+;* We assumed 24MHz bus clock and 4MHz external resonator clock frequency.  
+;* This program any user input (a typewriter). 
+;* 
+;*******************************************************
+;*******************************************************
+
+; export symbols - program starting point
+            XDEF        Entry        ; export 'Entry' symbol
+            ABSENTRY    Entry        ; for assembly entry point
+
+; include derivative specific macros
+PORTA       EQU         $0000
+PORTB       EQU         $0001
+DDRA        EQU         $0002
+DDRB        EQU         $0003
+
+; symbols/addresses
+ATDCTL2     EQU  $0082            ; Analog-to-Digital Converter (ADC) registers
+ATDCTL3     EQU  $0083
+ATDCTL4     EQU  $0084
+ATDCTL5     EQU  $0085
+ATDSTAT0    EQU  $0086
+ATDDR0H     EQU  $0090
+ATDDR0L     EQU  $0091
+ATDDR7H     EQU  $009e
+ATDDR7L     EQU  $009f
+
+SCIBDH      EQU         $00C8        ; Serial port (SCI) Baud Register H
+SCIBDL      EQU         $00C9        ; Serial port (SCI) Baud Register L
+SCICR2      EQU         $00CB        ; Serial port (SCI) Control Register 2
+SCISR1      EQU         $00CC        ; Serial port (SCI) Status Register 1
+SCIDRL      EQU         $00CF        ; Serial port (SCI) Data Register
+
+CRGFLG      EQU         $0037        ; Clock and Reset Generator Flags
+CRGINT      EQU         $0038        ; Clock and Reset Generator Interrupts
+RTICTL      EQU         $003B        ; Real Time Interrupt Control
+
+TIOS        EQU         $0040   ; Timer Input Capture (IC) or Output Compare (OC) select
+TIE         EQU         $004C   ; Timer interrupt enable register
+TCNTH       EQU         $0044   ; Timer free runing main counter
+TSCR1       EQU         $0046   ; Timer system control 1
+TSCR2       EQU         $004D   ; Timer system control 2
+TFLG1       EQU         $004E   ; Timer interrupt flag 1
+TC6H        EQU         $0056   ; Timer channel 3 register
+
+
+
+CR          equ         $0d          ; carriage return, ASCII 'Return' key
+LF          equ         $0a          ; line feed, ASCII 'next line' character
+DATAmax     equ         2048    ; Data count maximum, 2048 constant
+;*******************************************************
+; variable/data section
+            ORG    $3000             ; RAMStart defined as $3000
+                                     ; in MC9S12C128 chip
+ATDdone     DS.B   1               ; ADC finish indicator, 1 = ATD finished
+timeh       Dc.B   0                 ; Hour
+timem       Dc.B   0                 ; Minute
+times       Dc.B   0                 ; Second
+timec       DS.B   1
+hex1        dc.b   0
+hex2        dc.b   0
+deconst1    dc.w   0
+deconst2    dc.w   0
+sumdec      dc.w   0
+dec1        dc.b   0
+dec2        dc.b   0
+dec3        dc.b   0
+dec4        dc.b   0
+dec5        dc.b   0
+ctr2p5m     DS.W   1                 ; interrupt counter for 2.5 mSec. of time
+Saveinput   ds.b   20
+ctr125u     DS.W   1            ; 16bit interrupt counter for 125 uSec. of time
+BUF         DS.B   6            ; character buffer for a 16bit number in decimal ASCII
+CTR         DS.B   1            ; character buffer fill count
+counter     dc.b   0
+;*******************************************************
+; interrupt vector section
+            ORG    $FFF0             ; RTI interrupt vector setup for the simulator
+;            ORG    $3FF0             ; RTI interrupt vector setup for the CSM-12C128 board
+            DC.W   rtiisr
+
+            ORG     $FFE8       ; Timer channel 3 interrupt vector setup, on simulator
+            DC.W    oc3isr
+;*******************************************************
+; code section
+
+            ORG    $3100
+Entry
+            LDS    #Entry         ; initialize the stack pointer
+
+            LDAA   #%11111111   ; Set PORTA and PORTB bit 0,1,2,3,4,5,6,7
+            STAA   DDRA         ; all bits of PORTA as output
+            STAA   PORTA        ; set all bits of PORTA, initialize
+            STAA   DDRB         ; all bits of PORTB as output
+            STAA   PORTB        ; set all bits of PORTB, initialize
+
+            ldaa   #$0C         ; Enable SCI port Tx and Rx units
+            staa   SCICR2       ; disable SCI interrupts
+
+            ldd    #$0001       ; Set SCI Baud Register = $0001 => 1.5M baud at 24MHz (for simulation)
+;            ldd    #$0002       ; Set SCI Baud Register = $0002 => 750K baud at 24MHz
+;            ldd    #$000D       ; Set SCI Baud Register = $000D => 115200 baud at 24MHz
+;            ldd    #$009C       ; Set SCI Baud Register = $009C => 9600 baud at 24MHz
+            std    SCIBDH       ; SCI port baud rate change
+            ; ATD initialization
+            LDAA  #%11000000       ; Turn ON ADC, clear flags, Disable ATD interrupt
+            STAA  ATDCTL2
+            LDAA  #%00001000       ; Single conversion per sequence, no FIFO
+            STAA  ATDCTL3
+            LDAA  #%10000111       ; 8bit, ADCLK=24MHz/16=1.5MHz, sampling time=2*(1/ADCLK)
+            STAA  ATDCTL4          ; for SIMULATION
+
+
+            
+            bset   RTICTL,%00011001 ; set RTI: dev=10*(2**10)=2.555msec for C128 board
+                                    ;      4MHz quartz oscillator clock
+            bset   CRGINT,%10000000 ; enable RTI interrupt
+            bset   CRGFLG,%10000000 ; clear RTI IF (Interrupt Flag)
+            
+
+            ldx    #0
+
+            stx    ctr2p5m          ; initialize interrupt counter with 0.
+            cli
+            
+            ldaa   #0
+            staa   PORTB
+            staa   PORTA             ;present 0 : 0 0
+            
+printstart  ldx    #msg1          ; print the first message, 'Hello'
+            jsr    printmsg
+            
+            ldx    #Saveinput
+            jsr     delay1ms         ; flush out SCI serial port 
+                                     ; wait to finish sending last characters
+
+looop       
+            jsr    timer 
+            jsr    getchar          ; type writer - check the key board
+            cmpa   #00                    ;  if nothing typed, keep checking
+            beq    looop
+            
+                                    ;  otherwise - what is typed on key board
+            jsr    putchar          ; is displayed on the terminal window
+            staa   1,x+
+            
+            cmpa   #CR
+            bne    looop            ; if Enter/Return key is pressed, move the
+            
+            ldaa   #LF              ; cursor to next line
+            jsr    putchar
+            
+            
+readinput   
+            ldx    #Saveinput
+            ldaa   0,x
+            cmpa   #'s'
+            lbeq    sop     
+            
+            cmpa   #'g'
+            beq    goperations
+            
+            cmpa   #'q'
+            lbeq    typewrite
+            
+            cmpa   #'a'
+            beq    ad
+ 
+            lbra    errorletter1
+            
+ad
+            ldaa   1,x
+            cmpa   #'d'
+            beq    adc
+            
+            lbra   errorletter1
+            
+adc         ldaa   2,x
+            cmpa   #'c'
+            beq    adcoper
+            lbra   errorletter1
+            
+            
+adcoper        
+            ldx     #0               ; Enter/Return key hit
+            stx     ctr125u
+            jsr     StartTimer3oc
+            cli
+loopadc
+            jsr     timer
+
+            ldd     ctr125u
+            cpd     #DATAmax         ; 2048 bytes will be sent, the receiver at Windows PC 
+            bhs     loopadcON         ;   will only take 1024 bytes.
+            bra     loopadc         ; set Terminal Cache Size to 10000 lines, update from 1000 lines
+
+loopadcON
+            LDAA    #%00000000
+            STAA    TIE               ; disable OC3 interrupt
+
+            jsr     nextline
+            jsr     nextline
+ 
+            
+            lbra   printstart
+
+goperations
+
+            ldaa   1,x
+            cmpa   #'w'
+            beq    gwoperation
+            
+            cmpa   #'t'
+            lbeq    gtoperation
+            
+            cmpa   #'q'
+            lbeq    gqoperation
+            
+            
+            lbra   errorletter
+           
+
+gwoperation 
+            ldaa   2,x
+            cmpa   #'2'
+            lbeq   gw2operation
+            cmpa   #CR
+            lbne   errorletter
+            
+            ldx    #msg7
+            jsr    printmsg
+            jsr    nextline
+            ;generating wave
+            ldx     #0               ; Enter/Return key hit
+            stx     ctr125u
+            jsr     StartTimer3oc
+            cli
+loop1024
+            jsr     timer
+            ldd     ctr125u
+            cpd     #DATAmax         ; 2048 bytes will be sent, the receiver at Windows PC 
+            bhs     loopTxON         ;   will only take 1024 bytes.
+            bra     loop1024         ; set Terminal Cache Size to 10000 lines, update from 1000 lines
+
+loopTxON
+            LDAA    #%00000000
+            STAA    TIE               ; disable OC3 interrupt
+
+            jsr     nextline
+            jsr     nextline
+
+
+            
+            lbra   printstart
+            
+            
+gw2operation
+            ldx    #msg8
+            jsr    printmsg
+            jsr    nextline
+            ;generating wave
+            ldx     #0               ; Enter/Return key hit
+            stx     ctr125u
+            jsr     StartTimer3oc
+            cli
+loop8192
+            jsr     timer
+            ldd     ctr125u
+            cpd     #8192         ; 2048 bytes will be sent, the receiver at Windows PC 
+            bhs     loopTxONgw2         ;   will only take 1024 bytes.
+            bra     loop8192         ; set Terminal Cache Size to 10000 lines, update from 1000 lines
+
+loopTxONgw2
+            LDAA    #%00000000
+            STAA    TIE               ; disable OC3 interrupt
+
+            jsr     nextline
+            jsr     nextline
+
+  
+            lbra   printstart
+                
+gtoperation
+            ldx    #msg9
+            jsr    printmsg
+            jsr    nextline
+            ;generating wave
+            ldx     #0               ; Enter/Return key hit
+            stx     ctr125u
+            jsr     StartTimer3oc
+            cli
+looptri
+            jsr     timer
+            ldd     ctr125u
+            cpd     #2048         ; 2048 bytes will be sent, the receiver at Windows PC 
+            bhs     loopTxONtri         ;   will only take 1024 bytes.
+            bra     looptri         ; set Terminal Cache Size to 10000 lines, update from 1000 lines
+
+loopTxONtri
+            LDAA    #%00000000
+            STAA    TIE               ; disable OC3 interrupt
+
+            jsr     nextline
+            jsr     nextline
+
+ 
+            lbra   printstart
+            
+gqoperation
+            ldaa   2,x
+            cmpa   #'2'
+            lbeq   gq2operation
+            cmpa   #CR
+            lbne   errorletter
+            
+            ldx    #msg10
+            jsr    printmsg
+            jsr    nextline
+            ;generating wave
+            ldx     #0               ; Enter/Return key hit
+            stx     ctr125u
+            jsr     StartTimer3oc
+            cli
+loopsq
+            jsr     timer
+            ldd     ctr125u
+            cpd     #2048         ; 2048 bytes will be sent, the receiver at Windows PC 
+            bhs     loopTxONsq         ;   will only take 1024 bytes.
+            bra     loopsq         ; set Terminal Cache Size to 10000 lines, update from 1000 lines
+
+loopTxONsq
+            LDAA    #%00000000
+            STAA    TIE               ; disable OC3 interrupt
+
+            jsr     nextline
+            jsr     nextline
+
+
+            
+            lbra   printstart
+            
+gq2operation
+            ldx    #msg11
+            jsr    printmsg
+            jsr    nextline
+            ;generating wave
+            ldx     #0               ; Enter/Return key hit
+            stx     ctr125u
+            jsr     StartTimer3oc
+            cli
+loopsq2
+            jsr     timer
+            ldd     ctr125u
+            cpd     #8192         ; 2048 bytes will be sent, the receiver at Windows PC 
+            bhs     loopTxONsq2         ;   will only take 1024 bytes.
+            bra     loopsq2         ; set Terminal Cache Size to 10000 lines, update from 1000 lines
+
+loopTxONsq2
+            LDAA    #%00000000
+            STAA    TIE               ; disable OC3 interrupt
+
+            jsr     nextline
+            jsr     nextline
+
+
+            
+            lbra   printstart  
+;subroutine section below
+sop         
+            ldaa   1,x
+            cmpa   #' '
+            lbne    errordata              ;error checking
+            
+            ldaa   2,x
+            cmpa   #'9'
+            lbhi    errordata
+            cmpa   #'0'
+            lblo   errordata
+            
+            ldaa   3,x
+            cmpa   #':'
+            lbne    errordata
+            
+            ldab   4,x
+            cmpb   #'5'
+            lbhi    errordata          ;get timem from user input
+            cmpa   #'0'
+            lblo   errordata
+            
+            
+            ldaa   5,x
+            cmpa   #'9'
+            lbhi    errordata
+            cmpa   #'0'
+            lblo   errordata
+            ldaa   6,x
+            cmpa   #CR
+            lbne    errordata
+            
+            ;print the number to clock
+            ldaa   2,x
+            suba   #$30              ;get timeh from user input
+            staa   timeh
+            staa   PORTA
+            
+            ldab   4,x
+            ldaa   #$10
+            subb   #$30               ;
+            mul
+            stab   timem
+            
+            ldaa   5,x
+            suba   #$30
+            staa   times
+            ldaa   timec
+            adda   times
+            adda   timem              ;get times from user input
+            staa   PORTB
+            
+            lbra    printstart
+;***********single AD conversiton*********************
+; This is a sample, non-interrupt, busy wait method
+;
+go2ADC
+            PSHA                   ; Start ATD conversion
+            LDAA  #%10000111       ; right justified, unsigned, single conversion,
+            STAA  ATDCTL5          ; single channel, CHANNEL 7, start the conversion
+
+adcwait     ldaa  ATDSTAT0         ; Wait until ATD conversion finish
+            anda  #%10000000       ; check SCF bit, wait for ATD conversion to finish
+            beq   adcwait
+
+            
+
+            ldaa  ATDDR0L          ; for SIMULATOR, pick up the lower 8bit result
+            ldab  ATDDR0L         ; for pnum10
+            ;clra
+            
+            ;jsr   pnum10
+            jsr   printHx          ; print the ATD result
+            jsr   hextodec
+                
+            jsr   nextline
+
+            PULA
+            RTS     
+;***********printHx***************************
+; prinHx: print the content of accumulator A in Hex on SCI port
+printHx     psha
+            lsra
+            lsra
+            lsra
+            lsra
+            cmpa   #$09
+            bhi    alpha1
+            adda   #$30
+            staa   hex1
+            ;jsr    putchar
+            bra    low4bits
+alpha1      adda   #$37
+            staa   hex1
+            ;jsr    putchar            
+low4bits    pula
+            anda   #$0f
+            cmpa   #$09
+            bhi    alpha2
+            adda   #$30   
+            staa   hex2
+            ;jsr    putchar
+            rts
+alpha2      adda   #$37
+            staa   hex2
+            ;jsr    putchar
+            rts    
+
+;***************hex to dec************************   
+
+hextodec    pshx
+            psha
+            pshb
+            pshy
+            
+            ldaa  hex1;  load 3 to a
+            
+            ldab  #0      ;$0300 in a
+            cmpa  #'9'   ; in 0-9
+            bhi   letcon1
+            suba  #$30
+            ;staa  hex1
+            bra   neext1
+            
+letcon1     suba  #$37
+            ;staa  hex1
+            
+neext1      
+            
+            ldab  #16
+            mul
+            
+            std   deconst1  ; =  12288
+            
+            
+            ldaa  hex2;  load 5 to a
+            cmpa  #'9'   ; in 0-9
+            bhi   letcon2
+            suba  #$30
+            ;staa  hex2
+            bra   neext2
+            
+letcon2     suba  #$37
+            ;staa  hex2
+            
+            
+neext2       
+            tfr   a,b
+            ldaa  #0 
+            
+            std   deconst2  ; =  12288
+            
+            
+
+;*****************from here is to convert decimal sum to single character*******
+;for example sum = 48, 48/
+;max  $ff = 255
+neext3      ldd   deconst1 
+            addd  deconst2     
+
+            tfr   d,x
+            stx   sumdec       ;final decimal = 13619
+            
+            ldd   sumdec
+            
+            
+            ldx   #10
+            IDIV              ; 13619/10 = 1361 in x 9 in d
+            
+            cmpb  #9   ; if its A to F
+            bhi   decletter1
+            addb  #$30
+            stab  dec5
+            
+            bra   nextt1
+decletter1  addb  #$37
+            stab  dec5
+            
+            
+nextt1      stx   sumdec      ; save 1361
+
+            cpx   #0  
+            lbeq  decdone     ; if no more division
+            
+            ldd   sumdec      ;
+            ldx   #10
+            IDIV               ;1361/10    = 136 in x 1 in d
+            cmpb  #9   ; if its A to F
+            bhi   decletter2
+            addb  #$30
+            stab  dec4
+            
+            bra   nextt2
+decletter2  addb  #$37
+            stab  dec4
+            
+nextt2      stx   sumdec  
+            cpx   #0  
+            lbeq   decdone     ; if no more division
+            
+            ldd   sumdec      ;
+            ldx   #10
+            IDIV               ;136/10    = 13 in x 6 in d
+            cmpb  #9   ; if its A to F
+            bhi   decletter3
+            addb  #$30
+            stab  dec3
+            
+            bra   nextt3
+decletter3  addb  #$37
+            stab  dec3
+            
+nextt3      stx   sumdec  
+            cpx   #0  
+            beq   decdone     ; if no more division
+            
+            ldd   sumdec      ;
+            ldx   #10
+            IDIV               ;13/10    = 10 in x 3 in d
+            cmpb  #9   ; if its A to F
+            bhi   decletter4
+            addb  #$30
+            stab  dec2
+            
+            bra   nextt4
+decletter4  addb  #$37
+            stab  dec2
+            
+
+nextt4      stx   sumdec  
+            cpx   #0  
+            beq   decdone     ; if no more division
+            
+            ldd   sumdec      ;
+            
+ 
+            ldx   #10
+            IDIV               ;1/10    = 1 in x 0 in d
+            cmpb  #9   ; if its A to F
+            bhi   decletter5
+            addb  #$30
+            stab  dec1
+            
+            bra   nextt5
+decletter5  addb  #$37
+            stab  dec1
+            
+
+nextt5      stx   sumdec  
+            cpx   #0  
+            beq   decdone     ; if no more division
+            
+decdone     ldd   sumdec       ;if sumdec more than 5 digit, error report
+            cmpb  #0
+            lbne  errorletter
+            
+            
+pdec3       ldaa  dec3
+            cmpa  #0
+            beq   p2dec
+            
+p3dec       ldaa  dec3
+            jsr   putchar
+            ldaa  dec4
+            jsr   putchar
+            ldaa  dec5
+            jsr   putchar
+            lbra  decpdone
+            
+p2dec       ldaa  dec4
+            cmpa  #0
+            beq   p1orp3dec
+            
+            ldaa  dec4
+            jsr   putchar
+            ldaa  dec5
+            jsr   putchar
+            lbra   decpdone
+            
+p1orp3dec   
+            ldaa  dec3
+            cmpa  #0
+            bne   p3dec
+             
+            ldaa  dec5
+            jsr   putchar   
+            ;after print initialize the data
+decpdone    ldaa  #0
+            staa  dec1
+            staa  dec2
+            staa  dec3
+            staa  dec4
+            staa  dec5                      
+            puly
+            pulb
+            pula
+            pulx
+            rts
+;***************StartTimer6oc************************
+;* Program: Start the timer interrupt, timer channel 6 output compare
+;* Input:   Constants - channel 6 output compare, 125usec at 24MHz
+;* Output:  None, only the timer interrupt
+;* Registers modified: D used and CCR modified
+;* Algorithm:
+;             initialize TIOS, TIE, TSCR1, TSCR2, TC2H, and TFLG1
+;**********************************************
+StartTimer3oc
+            PSHD
+            LDAA   #%00001000
+            STAA   TIOS              ; set CH6 Output Compare
+            STAA   TIE               ; set CH6 interrupt Enable
+            LDAA   #%10000000        ; enable timer, Fast Flag Clear not set
+            STAA   TSCR1
+            LDAA   #%00000000        ; TOI Off, TCRE Off, TCLK = BCLK/1
+            STAA   TSCR2             ;   not needed if started from reset
+
+            LDD    #3000            ; 125usec with (24MHz/1 clock)
+            ADDD   TCNTH            ;    for first interrupt
+            STD    TC6H             ; 
+
+            BSET   TFLG1,%00001000   ; initial Timer CH6 interrupt flag Clear, not needed if fast clear set
+            LDAA   #%00001000
+            STAA   TIE               ; set CH6 interrupt Enable
+            PULD
+            RTS     
+;***********RTI interrupt service routine***************
+rtiisr      bset   CRGFLG,%10000000 ; clear RTI Interrupt Flag - for the next one
+            
+            ldx    ctr2p5m          ; every time the RTI occur, increase
+            inx                     ;    the 16bit interrupt count
+            stx    ctr2p5m
+rtidone     RTI
+
+;***********Timer OC6 interrupt service routine***************
+oc3isr
+            ldd   #3000              ; 125usec with (24MHz/1 clock)
+            addd  TC6H               ;    for next interrupt
+            std   TC6H               ; 
+            bset  TFLG1,%00001000    ; clear timer CH3 interrupt flag, not needed if fast clear enabled
+            ldd   ctr125u
+            
+            ldy   #Saveinput
+            ldaa  1,y
+            cmpa  #'w'
+            beq   sawtooth
+            cmpa  #'q'
+            beq   square
+            cmpa  #'t'
+            lbeq   triangle
+            cmpa  #'d'
+            beq   adoper
+            lbra   errorletter
+            
+adoper      
+            ldaa  3,y
+            cmpa  #CR
+            lbne  errorletter
+            
+            ldaa  2,y
+            cmpa  #'c'
+            beq   adcoperat
+            
+            
+            lbra  errorletter
+            
+adcoperat   
+            jsr   go2ADC
+            ldx   ctr125u
+            inx                      ; update OC3 (125usec) interrupt counter
+            stx   ctr125u
+            lbra  oc3done         
+sawtooth    
+            ldaa  2,y
+            cmpa  #'2'
+            beq   sawtooth125
+            ldx   ctr125u
+            inx                      ; update OC3 (125usec) interrupt counter
+            stx   ctr125u
+            clra                     ;   print ctr125u, only the last byte 
+            jsr   pnum10             ;   to make the file RxData3.txt with exactly 1024 data 
+            lbra   oc3done
+            
+sawtooth125         
+            ldx   ctr125u
+            inx  
+            inx
+            inx
+            inx                    
+                                     ; change the step size to 64 steps
+            stx   ctr125u
+            clra                     ;   print ctr125u, only the last byte 
+            jsr   pnum10             ;   to make the file RxData3.txt with exactly 1024 data 
+            lbra   oc3done
+            
+square    
+            ldd   ctr125u
+            ldx   #127
+            idiv
+            cpx   #1
+            beq   print255
+            cpx   #0
+            beq   print0
+            
+divi2       tfr   x,d
+            ldx   #2
+            idiv                ;find the odd or even
+            
+            cpd   #1
+            beq   print255
+            cpd   #0
+            beq   print0
+
+            bra   divi2
+            
+
+            
+print0      
+            
+            ldaa  #'0'
+            jsr   putchar
+            jsr   nextline
+            ldaa  2,y
+            cmpa  #'2'
+            beq   sq2
+            ldx   ctr125u
+            inx
+            stx   ctr125u
+            bra   oc3done
+            
+sq2         ldx   ctr125u
+            inx
+            inx
+            inx
+            inx
+            stx   ctr125u
+            bra   oc3done
+            
+print255    
+            
+            ldaa  #'2'
+            jsr   putchar
+            ldaa  #'5'
+            jsr   putchar
+            jsr   putchar
+            jsr   nextline
+            ldaa  2,y
+            cmpa  #'2'
+            beq   sq2
+            ldx   ctr125u
+            inx
+            stx   ctr125u
+            
+            bra   oc3done
+            
+triangle
+            ldd   ctr125u
+            ldx   #128
+            idiv
+            std   counter
+            cpx   #1
+            beq   godown
+            cpx   #0
+            beq   goup
+            
+divi3       tfr   x,d
+            ldx   #2
+            idiv                ;find the odd or even
+            
+            cpd   #1
+            beq   godown
+            cpd   #0
+            beq   goup
+
+            bra   divi3
+             
+godown     
+            
+            ldd   #127
+            subd  counter
+            
+            jsr   pnum10
+            ldx   ctr125u
+            inx
+          
+            stx   ctr125u
+            bra   oc3done
+            
+goup     
+            ldd  counter
+
+            jsr   pnum10
+            ldx   ctr125u
+            
+            inx
+            stx   ctr125u
+            bra   oc3done            
+oc3done     RTI
+;***********end of RTI interrupt service routine********
+
+;***********pnum10***************************
+;* Program: print a word (16bit) in decimal to SCI port
+;* Input:   Register D contains a 16 bit number to print in decimal number
+;* Output:  decimal number printed on the terminal connected to SCI port
+;* 
+;* Registers modified: CCR
+;* Algorithm:
+;     Keep divide number by 10 and keep the remainders
+;     Then send it out to SCI port
+;  Need memory location for counter CTR and buffer BUF(6 byte max)
+;**********************************************
+pnum10          pshd                   ;Save registers
+                pshx
+                pshy
+                clr     CTR            ; clear character count of an 8 bit number
+
+                ldy     #BUF
+pnum10p1        ldx     #10
+                idiv
+                beq     pnum10p2
+                stab    1,y+
+                inc     CTR
+                tfr     x,d
+                bra     pnum10p1
+
+pnum10p2        stab    1,y+
+                inc     CTR                        
+;--------------------------------------
+
+pnum10p3        ldaa    #$30                
+                adda    1,-y
+                jsr     putchar
+                dec     CTR
+                bne     pnum10p3
+                jsr     nextline
+                puly
+                pulx
+                puld
+                rts
+;***********end of pnum10********************
+;***********errorletter********
+errorletter 
+            ldaa  #CR                ; move the cursor to beginning of the line
+            jsr   putchar            ;   Cariage Return/Enter key
+            ldaa  #LF                ; move the cursor to next line, Line Feed
+            jsr   putchar
+            ldx   #msg2              ; print wrong command
+            jsr   printmsg
+            jsr    nextline
+            lbra  printstart
+            
+errordata 
+            ldaa  #CR                ; move the cursor to beginning of the line
+            jsr   putchar            ;   Cariage Return/Enter key
+            ldaa  #LF                ; move the cursor to next line, Line Feed
+            jsr   putchar
+            ldx   #msg3              ; print wrong command
+            jsr   printmsg
+            jsr    nextline
+            lbra  printstart
+            
+errorletter1 
+            ldaa  #CR                ; move the cursor to beginning of the line
+            jsr   putchar            ;   Cariage Return/Enter key
+            ldaa  #LF                ; move the cursor to next line, Line Feed
+            jsr   putchar
+            ldx   #msg6              ; print wrong command
+            jsr   printmsg
+            jsr    nextline
+            lbra  printstart
+;***************LEDtoggle**********************
+;* Program: toggle LED if 0.5 second is up
+;* Input:   ctr2p5m variable
+;* Output:  ctr2p5m variable and LED1
+;* Registers modified: CCR
+;* Algorithm:
+;    Check for 0.5 second passed
+;      if not 0.5 second yet, just pass
+;      if 0.5 second has reached, then toggle LED and reset ctr2p5m
+;**********************************************
+timer       psha
+            pshx
+            pshy
+            
+            ldx    ctr2p5m          ; check for  1 sec
+;            cpx    #200             
+            cpx    #100           
+            blo    donetimeer       ; NOT yet
+
+            ldx    #0               ; 0.5sec is up,
+            stx    ctr2p5m          ;     clear counter to restart
+
+
+
+startf0     ldaa   times
+            inca   
+            cmpa   #10
+            beq    timer10
+            staa   times
+            
+            
+            ldaa   timec
+            
+            adda   times
+            adda   timem
+            
+            
+            staa   PORTB             ;show
+            
+
+
+            bra    donetimeer
+            
+timer10     
+            ldaa   timem
+            cmpa   #$50
+            beq    timer1mins
+            adda   #$10
+            staa   timem
+                      
+            
+            ldaa   #0
+            staa   times
+            
+            ldaa   timec
+            
+            adda   times
+            adda   timem
+            
+            
+            staa   PORTB             ;show
+            bra    donetimeer          
+            
+            
+            
+timer1mins
+            ldaa   #0
+            staa   times
+            staa   timem
+            staa   PORTB
+            
+            ldaa   timeh
+            cmpa   #9 
+            beq    reseth
+            inca
+            staa   PORTA
+            staa   timeh
+            bra    donetimeer     
+            
+            
+reseth
+            ldaa   #0
+            staa   timeh
+            staa   timem
+            staa   times
+            staa   PORTB
+            staa   PORTA
+
+
+donetimeer  
+            puly
+            pulx
+            pula
+            rts
+;***************end of LEDtoggle***************
+
+;***********printmsg***************************
+;* Program: Output character string to SCI port, print message
+;* Input:   Register X points to ASCII characters in memory
+;* Output:  message printed on the terminal connected to SCI port
+;* 
+;* Registers modified: CCR
+;* Algorithm:
+;     Pick up 1 byte from memory where X register is pointing
+;     Send it out to SCI port
+;     Update X register to point to the next byte
+;     Repeat until the byte data $00 is encountered
+;       (String is terminated with NULL=$00)
+;**********************************************
+NULL            equ     $00
+printmsg        psha                   ;Save registers
+                pshx
+printmsgloop    ldaa    1,X+           ;pick up an ASCII character from string
+                                       ;   pointed by X register
+                                       ;then update the X register to point to
+                                       ;   the next byte
+                cmpa    #NULL
+                beq     printmsgdone   ;end of strint yet?
+                bsr     putchar        ;if not, print character and do next
+                bra     printmsgloop
+printmsgdone    pulx 
+                pula
+                rts
+;***********end of printmsg********************
+;***********quit********************
+
+     
+            
+typewrite   
+            ldaa  1,x
+            cmpa  #CR
+            lbne   errorletter
+            ldaa  #CR                ; move the cursor to beginning of the line
+            jsr   putchar            ;   Cariage Return/Enter key
+            ldaa  #LF                ; move the cursor to next line, Line Feed
+            
+            ldx   #msg12              ; print the first message, 'Hello'
+            jsr   printmsg
+            
+            ldaa  #CR                ; move the cursor to beginning of the line
+            jsr   putchar            ;   Cariage Return/Enter key
+            ldaa  #LF                ; move the cursor to next line, Line Feed
+            
+            ldx   #msg13              ; print the second message, 'you may type below'
+            jsr   printmsg
+            
+            ldaa  #CR                ; move the cursor to beginning of the line
+            jsr   putchar            ;   Cariage Return/Enter key
+            ldaa  #LF                ; move the cursor to next line, Line Feed
+            
+loooop      jsr   getchar            ; type writer - check the key board
+            cmpa  #$00               ;  if nothing typed, keep checking
+            beq   loooop
+            jsr   putchar
+            ;staa  PORTB              ; show the character on PORTB
+            cmpa  #CR
+            bne   loooop              ; if Enter/Return key is pressed, move the
+            ldaa  #LF                ; cursor to next line
+            jsr   putchar
+            
+            bra   loooop
+;***************putchar************************
+;* Program: Send one character to SCI port, terminal
+;* Input:   Accumulator A contains an ASCII character, 8bit
+;* Output:  Send one character to SCI port, terminal
+;* Registers modified: CCR
+;* Algorithm:
+;    Wait for transmit buffer become empty
+;      Transmit buffer empty is indicated by TDRE bit
+;      TDRE = 1 : empty - Transmit Data Register Empty, ready to transmit
+;      TDRE = 0 : not empty, transmission in progress
+;**********************************************
+putchar     brclr SCISR1,#%10000000,putchar   ; wait for transmit buffer empty
+            staa  SCIDRL                      ; send a character
+            rts
+;***************end of putchar*****************
+
+;****************getchar***********************
+;* Program: Input one character from SCI port (terminal/keyboard)
+;*             if a character is received, other wise return NULL
+;* Input:   none    
+;* Output:  Accumulator A containing the received ASCII character
+;*          if a character is received.
+;*          Otherwise Accumulator A will contain a NULL character, $00.
+;* Registers modified: CCR
+;* Algorithm:
+;    Check for receive buffer become full
+;      Receive buffer full is indicated by RDRF bit
+;      RDRF = 1 : full - Receive Data Register Full, 1 byte received
+;      RDRF = 0 : not full, 0 byte received
+;**********************************************
+
+getchar     brclr SCISR1,#%00100000,getchar7
+            ldaa  SCIDRL
+            rts
+getchar7    clra
+            rts
+;****************end of getchar**************** 
+;****************delay1ms**********************
+delay1ms:   pshx
+            ldx   #$1000           ; count down X, $8FFF may be more than 10ms 
+d1msloop    nop                    ;   X <= X - 1
+            dex                    ; simple loop
+            bne   d1msloop
+            pulx
+            rts
+
+;****************nextline**********************
+nextline    psha
+            ldaa  #CR              ; move the cursor to beginning of the line
+            jsr   putchar          ;   Cariage Return/Enter key
+            ldaa  #LF              ; move the cursor to next line, Line Feed
+            jsr   putchar
+            pula
+            rts
+;****************end of nextline***************
+
+msg1        DC.B   'HW11>', $00
+msg2        DC.B   'Invalid input format', $00
+msg3        DC.B   'Invalid time format. Correct example => 0:00 to 9:59', $00
+msg6        DC.B   'Invalid command. (s for set time and q for quit)', $00
+msg7        DC.B   'sawtooth wave generation .... ',$00
+msg8        DC.B   'sawtooth wave 125Hz generation .... ', $00
+msg9        DC.B   'triangle wave generation ....', $00
+msg10       DC.B   'square wave generation .... ', $00
+msg11       DC.B   'square wave 125Hz generation ....', $00
+msg12       DC.B   'Hello', $00
+msg13       DC.B   'you may type below', $00
+msg14       dc.b   '> Done!  Close Output file.',$00
+msg15       dc.b   '> Ready for next data transmission',$00
+            END               ; this is end of assembly source file
+                              ; lines below are ignored - not assembled/compiled
