@@ -1,5 +1,25 @@
 # ADC-for-HCS12C128
-For one wave cycle. There are 256 points, and 256 points for all square, sawtooth and triangle shape, but for 125hz, there are 256/4 = 64 points for 125hz square and sawtooth each cycle.
+
+;* CodeWarrior Simulator/Debug edition, not for CSM-12C128 board
+;* 2023/4/9  Tianhao Ji
+;* 
+;* 1 second timer, timer using Real Time Interrupt.
+;* This program is a 1 second timer using 
+;* a Real Time Interrupt service subroutine (RTIISR).  This program
+;* displays the time on the 7 Segment Disply in Visualization Tool 
+;* every 1 second.  That is, this program 
+;* displays '1 0 1 0 1 0 . . . ' on the 7 segment displys. 
+;* The 7 segment displys are connected to port B of
+;* MC9S12C32 chip in CodeWarrior Debugger/Simulator.
+;* Also on the Terminal component of the simulator,  
+;* user may enter any key, it will be displayed on the screen - effectively
+;* it is a typewriter.
+;*
+;* Please note the new feature of this program:
+;* RTI vector, initialization of CRGFLG, CRGINT, RTICTL, registers for the
+;* Real Time Interrupt.
+;* We assumed 24MHz bus clock and 4MHz external resonator clock frequency.  
+;* This program any user input (a typewriter). 
 
 Main logic is in: Source/main.acm
 # Examples
